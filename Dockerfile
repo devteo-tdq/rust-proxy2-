@@ -32,9 +32,9 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 WORKDIR /app
 
 # Copy file chạy từ giai đoạn Builder sang
-COPY --from=builder /app/target/release/hardcore_proxy .
+COPY --from=builder /app/target/release/proxy .
 
 
 
 # Lệnh chạy ứng dụng
-CMD ["./hardcore_proxy"]
+CMD ["./proxy"]
