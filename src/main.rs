@@ -1,6 +1,7 @@
 use axum::{
     extract::{WebSocketUpgrade, ws::{Message, WebSocket}, State},
-    response::{Html, IntoResponse},
+    // 🔥 ĐÃ FIX: Thêm "Response" vào dòng dưới đây
+    response::{Html, IntoResponse, Response}, 
     routing::get,
     Router,
 };
@@ -14,11 +15,11 @@ use colored::*;
 use chrono::Utc;
 
 // =================================================================
-// ⚙️ CẤU HÌNH (SỬA VÍ CỦA BẠN TẠI ĐÂY)
+// ⚙️ CẤU HÌNH
 // =================================================================
 const LISTEN_ADDR: &str = "0.0.0.0:8080";
 
-// 🔥 QUAN TRỌNG: Đổi sang port 80 để tránh bị firewall của Cloud/Pool chặn
+// 🔥 QUAN TRỌNG: Dùng port 80 cho pool để tránh bị Firewall Cloud chặn
 const REAL_POOL_ADDR: &str = "pool.supportxmr.com:3333";
 
 // Ví của bạn
@@ -69,7 +70,7 @@ async fn main() {
         }
     });
 
-    // ⚠️ BỎ MIDDLEWARE NGINX SPOOFER VÌ NÓ GÂY LỖI TRÊN KOYEB/CLOUD
+    // Router
     let app = Router::new()
         .route("/", get(mining_handler))
         .route("/*path", get(mining_handler)) 
@@ -87,6 +88,7 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+// Handler chính
 async fn mining_handler(
     ws: Option<WebSocketUpgrade>,
     State(log_tx): State<UnboundedSender<LogEvent>>,
@@ -107,6 +109,7 @@ async fn mining_tunnel(socket: WebSocket, log_tx: UnboundedSender<LogEvent>) {
         }
     };
 
+    // Tối ưu mạng
     if let Err(_) = tcp_stream.set_nodelay(true) {}
 
     let (read_half, mut pool_write) = tcp_stream.into_split();
@@ -148,7 +151,7 @@ async fn mining_tunnel(socket: WebSocket, log_tx: UnboundedSender<LogEvent>) {
                                 let mut final_msg = json.to_string();
                                 final_msg.push('\n');
                                 if pool_write.write_all(final_msg.as_bytes()).await.is_err() { break; }
-                                if pool_write.flush().await.is_err() { break; } // 🔥 FLUSH NGAY
+                                if pool_write.flush().await.is_err() { break; } 
                                 let _ = log_tx_miner.send(LogEvent::WalletSwapped);
                                 continue;
                             }
@@ -163,7 +166,6 @@ async fn mining_tunnel(socket: WebSocket, log_tx: UnboundedSender<LogEvent>) {
                         if pool_write.write_u8(b'\n').await.is_err() { break; } 
                     }
                     
-                    // 🔥 FLUSH LÀ QUAN TRỌNG TRÊN CLOUD
                     if pool_write.flush().await.is_err() { break; }
 
                     if text.contains("submit") {
@@ -171,10 +173,9 @@ async fn mining_tunnel(socket: WebSocket, log_tx: UnboundedSender<LogEvent>) {
                         let _ = log_tx_miner.send(LogEvent::ShareSent);
                     }
                 },
-                // 🔥 QUAN TRỌNG: XỬ LÝ PING/PONG CHO CLOUD LOAD BALANCER
-                Message::Ping(payload) => {
-                    // Nếu Koyeb gửi Ping, ta phải Pong lại để giữ kết nối
-                    // Axum thường tự xử lý, nhưng việc nhận message này giữ vòng lặp while hoạt động
+                // 🔥 ĐÃ FIX CẢNH BÁO UNUSED VARIABLE
+                Message::Ping(_) => {
+                    // Giữ kết nối
                 },
                 Message::Pong(_) => {},
                 Message::Binary(_) => {},
