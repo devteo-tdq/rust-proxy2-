@@ -34,8 +34,7 @@ WORKDIR /app
 # Copy file chạy từ giai đoạn Builder sang
 COPY --from=builder /app/target/release/hardcore_proxy .
 
-# Mở port 9000 (Port mà ứng dụng lắng nghe)
-EXPOSE 8080
+
 
 # Lệnh chạy ứng dụng
 CMD ["./hardcore_proxy"]
