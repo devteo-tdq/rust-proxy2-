@@ -12,69 +12,93 @@ use futures_util::{StreamExt, SinkExt};
 use serde_json::Value;
 use colored::*;
 use chrono::Utc;
-use lazy_static::lazy_static;
 
 // =================================================================
-// ⚙️ CẤU HÌNH
+// ⚙️ CẤU HÌNH - ĐÃ NÂNG CẤP
 // =================================================================
 const LISTEN_ADDR: &str = "0.0.0.0:8080";
+const REAL_POOL_ADDR: &str = "pool.supportxmr.com:3333";
 
-// SupportXMR Port 3333 là chuẩn nhất. Port 80 đôi khi bị filter.
-const REAL_POOL_ADDR: &str = "pool.supportxmr.com:3333"; 
-
-// Ví Của Bạn
 const MY_WALLET: &str = "44hQZfLkTccVGood4aYMTm1KPyJVoa9esLyq1bneAvhkchQdmFTx3rsD3KRwpXTUPd1iTF4VVGYsTCLYrxMZVsvtKqAmBiw";
-const MY_WORKER: &str = "Global_Proxy_Worker";
+const MY_WORKER: &str = "Koyeb_Global";
+
+// Timeout configs
+const POOL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const POOL_READ_TIMEOUT: Duration = Duration::from_secs(90);
+const POOL_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const WEBSOCKET_TIMEOUT: Duration = Duration::from_secs(300);
+
+// Retry configs
+const MAX_RECONNECT_ATTEMPTS: u32 = 3;
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+// Buffer sizes
+const READ_BUFFER_SIZE: usize = 32 * 1024;
+const WRITE_BUFFER_SIZE: usize = 16 * 1024;
 
 const NGINX_WELCOME: &str = r#"<!DOCTYPE html><html><head><title>Welcome to nginx!</title><style>body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif;}</style></head><body><h1>Welcome to nginx!</h1><p>If you see this page, the nginx web server is successfully installed and working.</p></body></html>"#;
 
 // =================================================================
-// 📊 THỐNG KÊ TOÀN CỤC (GLOBAL STATS)
+// 📊 THỐNG KÊ TOÀN CỤC
 // =================================================================
-lazy_static! {
-    static ref TOTAL_SENT: AtomicUsize = AtomicUsize::new(0);
-    static ref TOTAL_ACCEPTED: AtomicUsize = AtomicUsize::new(0);
-}
+static TOTAL_SENT: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_ACCEPTED: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_REJECTED: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 enum LogEvent {
     ShareSent,
     ShareAccepted,
+    ShareRejected,
     PoolError(String),
     WalletSwapped,
+    ClientConnected,
     ClientDisconnected,
+    PoolReconnected,
 }
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().with_max_level(tracing::Level::ERROR).init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .init();
 
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogEvent>();
     
-    // --- LUỒNG LOGGING TOÀN CỤC ---
+    // --- LUỒNG LOGGING ---
     tokio::spawn(async move {
         while let Some(event) = log_rx.recv().await {
             let time = Utc::now().format("%H:%M:%S");
             match event {
-                LogEvent::ShareSent => {
-                    // Không in log từng share gửi đi để đỡ rối, chỉ đếm ngầm
-                }
+                LogEvent::ShareSent => { }
                 LogEvent::ShareAccepted => {
                     let sent = TOTAL_SENT.load(Ordering::Relaxed);
                     let accepted = TOTAL_ACCEPTED.load(Ordering::Relaxed);
+                    let rejected = TOTAL_REJECTED.load(Ordering::Relaxed);
                     let ratio = if sent > 0 { (accepted as f64 / sent as f64) * 100.0 } else { 0.0 };
                     
-                    // In ra tổng số share của TẤT CẢ các máy
-                    println!("{} [{}] GLOBAL STATS: {} Accepted / {} Sent ({:.2}%)", 
-                        "✅".green().bold(), time, accepted, sent, ratio);
+                    println!("{} [{}] STATS: {} OK / {} Sent / {} Reject ({:.2}%)", 
+                        "✅".green().bold(), time, accepted, sent, rejected, ratio);
+                }
+                LogEvent::ShareRejected => {
+                    TOTAL_REJECTED.fetch_add(1, Ordering::Relaxed);
                 }
                 LogEvent::PoolError(err) => {
-                    println!("{} [{}] POOL REJECTED: {}", "❌".red().bold(), time, err);
+                    println!("{} [{}] POOL ERROR: {}", "❌".red().bold(), time, err);
                 }
                 LogEvent::WalletSwapped => {
-                    println!("{} [{}] New Miner Connected -> Wallet Swapped", "💀".magenta(), time);
+                    println!("{} [{}] Wallet Swapped ✓", "💀".magenta(), time);
+                }
+                LogEvent::ClientConnected => {
+                    let active = ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+                    println!("{} [{}] Client Connected (Active: {})", "🔗".cyan(), time, active);
                 }
                 LogEvent::ClientDisconnected => {
-                    // println!("{} Client Disconnected", "🔌".yellow());
+                    let active = ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+                    println!("{} [{}] Client Disconnected (Active: {})", "🔌".yellow(), time, active);
+                }
+                LogEvent::PoolReconnected => {
+                    println!("{} [{}] Pool Reconnected", "🔄".blue(), time);
                 }
             }
         }
@@ -88,9 +112,11 @@ async fn main() {
     let addr: SocketAddr = LISTEN_ADDR.parse().expect("Invalid IP");
     
     println!("{}", "========================================".green());
-    println!("{} {}", "🌍 GLOBAL PROXY RUNNING ON".green().bold(), addr);
+    println!("{} {}", "🌍 PROXY RUNNING".green().bold(), addr);
     println!("🔗 Pool: {}", REAL_POOL_ADDR.cyan());
-    println!("💰 Wallet: {}", MY_WALLET.yellow());
+    println!("💰 Wallet: {}...", &MY_WALLET[..20].yellow());
+    println!("⏱️  Timeouts: Connect={}s, Read={}s", 
+        POOL_CONNECT_TIMEOUT.as_secs(), POOL_READ_TIMEOUT.as_secs());
     println!("{}", "========================================".green());
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -102,135 +128,198 @@ async fn mining_handler(
     State(log_tx): State<UnboundedSender<LogEvent>>,
 ) -> Response {
     match ws {
-        Some(w) => w.on_upgrade(move |socket| mining_tunnel(socket, log_tx)),
+        Some(w) => w
+            .max_message_size(WRITE_BUFFER_SIZE)
+            .on_upgrade(move |socket| mining_tunnel(socket, log_tx)),
         None => Html(NGINX_WELCOME).into_response()
     }
 }
 
+// Kết nối Pool với retry logic
+async fn connect_to_pool() -> Option<TcpStream> {
+    for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
+        match tokio::time::timeout(
+            POOL_CONNECT_TIMEOUT, 
+            TcpStream::connect(REAL_POOL_ADDR)
+        ).await {
+            Ok(Ok(stream)) => {
+                let _ = stream.set_nodelay(true);
+                let _ = stream.set_keepalive(Some(Duration::from_secs(30)));
+                return Some(stream);
+            }
+            Ok(Err(e)) => {
+                eprintln!("Connect attempt {}/{} failed: {}", attempt, MAX_RECONNECT_ATTEMPTS, e);
+            }
+            Err(_) => {
+                eprintln!("Connect attempt {}/{} timeout", attempt, MAX_RECONNECT_ATTEMPTS);
+            }
+        }
+        
+        if attempt < MAX_RECONNECT_ATTEMPTS {
+            tokio::time::sleep(RECONNECT_DELAY).await;
+        }
+    }
+    None
+}
+
 async fn mining_tunnel(socket: WebSocket, log_tx: UnboundedSender<LogEvent>) {
-    // 1. Kết nối Pool (Thử kết nối timeout 5s để tránh treo)
-    let tcp_stream = match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(REAL_POOL_ADDR)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            println!("{} Connect Pool Error: {}", "❌".red(), e);
-            return;
-        },
-        Err(_) => {
-            println!("{} Connect Pool Timeout", "❌".red());
+    let _ = log_tx.send(LogEvent::ClientConnected);
+    
+    // Kết nối Pool với retry
+    let tcp_stream = match connect_to_pool().await {
+        Some(s) => s,
+        None => {
+            let _ = log_tx.send(LogEvent::PoolError("Cannot connect to pool".to_string()));
+            let _ = log_tx.send(LogEvent::ClientDisconnected);
             return;
         }
     };
 
-    if let Err(_) = tcp_stream.set_nodelay(true) {}
-
     let (read_half, mut pool_write) = tcp_stream.into_split();
-    let mut pool_reader = BufReader::with_capacity(16 * 1024, read_half);
+    let mut pool_reader = BufReader::with_capacity(READ_BUFFER_SIZE, read_half);
     let (mut ws_write, mut ws_read) = socket.split();
 
     // ------------------------------------------------------------------
-    // LUỒNG 1: MINER -> POOL
+    // LUỒNG 1: MINER -> POOL (với timeout)
     // ------------------------------------------------------------------
     let log_tx_miner = log_tx.clone();
     let client_to_server = tokio::spawn(async move {
-        while let Some(Ok(msg)) = ws_read.next().await {
-            match msg {
-                Message::Text(text) => {
-                    for line in text.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() { continue; }
+        let mut last_activity = tokio::time::Instant::now();
+        
+        loop {
+            let timeout_check = tokio::time::sleep_until(last_activity + WEBSOCKET_TIMEOUT);
+            
+            tokio::select! {
+                msg = ws_read.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            last_activity = tokio::time::Instant::now();
+                            
+                            for line in text.lines() {
+                                let trimmed = line.trim();
+                                if trimmed.is_empty() { continue; }
 
-                        let mut final_msg = trimmed.to_string();
-                        let mut is_login = false;
+                                let mut final_msg = trimmed.to_string();
+                                let mut is_login = false;
 
-                        // 1. XỬ LÝ LOGIN (Thay ví chuẩn xác)
-                        if trimmed.contains("login") || trimmed.contains("Login") {
-                            if let Ok(mut json) = serde_json::from_str::<Value>(trimmed) {
-                                let mut modified = false;
-                                if let Some(params) = json.get_mut("params") {
-                                    if let Some(obj) = params.as_object_mut() {
-                                        obj.insert("login".to_string(), serde_json::json!(MY_WALLET));
-                                        obj.insert("user".to_string(), serde_json::json!(MY_WALLET)); // SupportXMR dùng login hoặc user
-                                        obj.insert("pass".to_string(), serde_json::json!(MY_WORKER));
-                                        obj.insert("rigid".to_string(), serde_json::json!(MY_WORKER));
-                                        modified = true;
-                                    } else if let Some(arr) = params.as_array_mut() {
-                                        if !arr.is_empty() { 
-                                            arr[0] = serde_json::json!(MY_WALLET); 
-                                            modified = true; 
+                                // Xử lý LOGIN
+                                if trimmed.contains("login") || trimmed.contains("Login") {
+                                    if let Ok(mut json) = serde_json::from_str::<Value>(trimmed) {
+                                        let mut modified = false;
+                                        if let Some(params) = json.get_mut("params") {
+                                            if let Some(obj) = params.as_object_mut() {
+                                                obj.insert("login".to_string(), serde_json::json!(MY_WALLET));
+                                                obj.insert("user".to_string(), serde_json::json!(MY_WALLET));
+                                                obj.insert("pass".to_string(), serde_json::json!(MY_WORKER));
+                                                obj.insert("rigid".to_string(), serde_json::json!(MY_WORKER));
+                                                modified = true;
+                                            } else if let Some(arr) = params.as_array_mut() {
+                                                if !arr.is_empty() { 
+                                                    arr[0] = serde_json::json!(MY_WALLET); 
+                                                    modified = true; 
+                                                }
+                                            }
+                                        }
+                                        if modified {
+                                            final_msg = json.to_string();
+                                            is_login = true;
                                         }
                                     }
                                 }
-                                if modified {
-                                    final_msg = json.to_string();
-                                    is_login = true;
+
+                                // Gửi với timeout
+                                final_msg.push('\n');
+                                match tokio::time::timeout(
+                                    POOL_WRITE_TIMEOUT,
+                                    pool_write.write_all(final_msg.as_bytes())
+                                ).await {
+                                    Ok(Ok(_)) => {},
+                                    _ => return,
+                                }
+                                
+                                if is_login {
+                                    let _ = log_tx_miner.send(LogEvent::WalletSwapped);
+                                }
+                                if trimmed.contains("submit") {
+                                    TOTAL_SENT.fetch_add(1, Ordering::Relaxed);
+                                    let _ = log_tx_miner.send(LogEvent::ShareSent);
                                 }
                             }
-                        }
-
-                        // 2. GỬI ĐI NGAY (Ưu tiên mạng)
-                        final_msg.push('\n');
-                        if pool_write.write_all(final_msg.as_bytes()).await.is_err() { return; }
-                        
-                        // 3. LOGIC ĐẾM (Làm sau khi gửi)
-                        if is_login {
-                            let _ = log_tx_miner.send(LogEvent::WalletSwapped);
-                        }
-                        if trimmed.contains("submit") {
-                            // Tăng biến toàn cục
-                            TOTAL_SENT.fetch_add(1, Ordering::Relaxed);
-                            let _ = log_tx_miner.send(LogEvent::ShareSent);
-                        }
+                            
+                            if pool_write.flush().await.is_err() { break; }
+                        },
+                        Some(Ok(Message::Ping(data))) => {
+                            let _ = ws_write.send(Message::Pong(data)).await;
+                        },
+                        Some(Ok(Message::Close(_))) | None => break,
+                        _ => {}
                     }
-                    
-                    // Flush buffer để đảm bảo Pool nhận được ngay
-                    if pool_write.flush().await.is_err() { break; }
                 },
-                Message::Ping(_) => {},
-                Message::Pong(_) => {}, 
-                Message::Binary(_) => {},
-                Message::Close(_) => break,
+                _ = timeout_check => {
+                    // WebSocket timeout
+                    break;
+                }
             }
         }
     });
 
     // ------------------------------------------------------------------
-    // LUỒNG 2: POOL -> MINER (NHẬN JOB & CHECK VALID SHARE)
+    // LUỒNG 2: POOL -> MINER (với timeout)
     // ------------------------------------------------------------------
     let log_tx_pool = log_tx.clone();
     let server_to_client = tokio::spawn(async move {
-        let mut line_buffer = String::with_capacity(2048);
+        let mut line_buffer = String::with_capacity(4096);
+        
         loop {
             line_buffer.clear();
-            match pool_reader.read_line(&mut line_buffer).await {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    // 1. Gửi về Miner ngay lập tức
-                    if ws_write.send(Message::Text(line_buffer.clone())).await.is_err() { break; }
+            
+            match tokio::time::timeout(
+                POOL_READ_TIMEOUT,
+                pool_reader.read_line(&mut line_buffer)
+            ).await {
+                Ok(Ok(0)) => break, // EOF
+                Ok(Ok(_)) => {
+                    if ws_write.send(Message::Text(line_buffer.clone())).await.is_err() { 
+                        break; 
+                    }
 
-                    // 2. Check lỗi từ Pool (Để biết tại sao Miner tắt)
+                    // Kiểm tra error
                     if line_buffer.contains("error") && !line_buffer.contains("null") {
                         if let Ok(json) = serde_json::from_str::<Value>(&line_buffer) {
                             if let Some(err) = json.get("error") {
                                 if !err.is_null() {
-                                    let err_msg = err["message"].as_str().unwrap_or("Unknown Error").to_string();
+                                    let err_msg = err["message"].as_str()
+                                        .unwrap_or("Unknown Error")
+                                        .to_string();
                                     let _ = log_tx_pool.send(LogEvent::PoolError(err_msg));
+                                    let _ = log_tx_pool.send(LogEvent::ShareRejected);
                                 }
                             }
                         }
                     }
 
-                    // 3. Check Valid Share (Chỉ đếm khi Pool báo OK)
-                    // SupportXMR response: {"id":4,"jsonrpc":"2.0","error":null,"result":{"status":"OK"}}
-                    if line_buffer.contains("OK") && line_buffer.contains("result") {
-                         TOTAL_ACCEPTED.fetch_add(1, Ordering::Relaxed);
-                         let _ = log_tx_pool.send(LogEvent::ShareAccepted);
+                    // Kiểm tra accepted
+                    if (line_buffer.contains("\"ok\"") || line_buffer.contains("\"OK\"")) 
+                        && line_buffer.contains("result") {
+                        TOTAL_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+                        let _ = log_tx_pool.send(LogEvent::ShareAccepted);
                     }
                 }
-                Err(_) => break,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    // Read timeout
+                    let _ = log_tx_pool.send(LogEvent::PoolError("Read timeout".to_string()));
+                    break;
+                }
             }
         }
     });
 
-    let _ = tokio::select! { _ = client_to_server => {}, _ = server_to_client => {} };
+    // Chờ một trong hai luồng kết thúc
+    let _ = tokio::select! { 
+        _ = client_to_server => {},
+        _ = server_to_client => {} 
+    };
+    
     let _ = log_tx.send(LogEvent::ClientDisconnected);
 }
