@@ -1,5 +1,5 @@
 [package]
-name = "hardcore_proxy"
+name = "stable_proxy"
 version = "0.1.0"
 edition = "2021"
 
@@ -15,13 +15,12 @@ serde_json = "1.0"
 futures-util = "0.3"
 chrono = "0.4"
 colored = "2.0"
-bytes = "1.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
 [profile.release]
-opt-level = 3           # Tối ưu tốc độ xử lý (Max Speed)
-lto = true              # Link Time Optimization (Giảm dung lượng, tăng tốc)
-codegen-units = 1       # Build chậm hơn chút nhưng code chạy nhanh hơn
-panic = "abort"         # Loại bỏ stack trace để giảm dung lượng
-strip = true            # Xóa các ký tự debug (Làm file nhẹ và bảo mật hơn)
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
