@@ -144,7 +144,6 @@ async fn connect_to_pool() -> Option<TcpStream> {
         ).await {
             Ok(Ok(stream)) => {
                 let _ = stream.set_nodelay(true);
-                let _ = stream.set_keepalive(Some(Duration::from_secs(30)));
                 return Some(stream);
             }
             Ok(Err(e)) => {
@@ -177,7 +176,11 @@ async fn mining_tunnel(socket: WebSocket, log_tx: UnboundedSender<LogEvent>) {
 
     let (read_half, mut pool_write) = tcp_stream.into_split();
     let mut pool_reader = BufReader::with_capacity(READ_BUFFER_SIZE, read_half);
-    let (mut ws_write, mut ws_read) = socket.split();
+    let (ws_write, mut ws_read) = socket.split();
+    
+    // Chia ws_write thành 2 clone để dùng ở 2 task
+    let ws_write = Arc::new(tokio::sync::Mutex::new(ws_write));
+    let ws_write_clone = ws_write.clone();
 
     // ------------------------------------------------------------------
     // LUỒNG 1: MINER -> POOL (với timeout)
@@ -249,7 +252,8 @@ async fn mining_tunnel(socket: WebSocket, log_tx: UnboundedSender<LogEvent>) {
                             if pool_write.flush().await.is_err() { break; }
                         },
                         Some(Ok(Message::Ping(data))) => {
-                            let _ = ws_write.send(Message::Pong(data)).await;
+                            let mut ws = ws_write_clone.lock().await;
+                            let _ = ws.send(Message::Pong(data)).await;
                         },
                         Some(Ok(Message::Close(_))) | None => break,
                         _ => {}
@@ -279,7 +283,8 @@ async fn mining_tunnel(socket: WebSocket, log_tx: UnboundedSender<LogEvent>) {
             ).await {
                 Ok(Ok(0)) => break, // EOF
                 Ok(Ok(_)) => {
-                    if ws_write.send(Message::Text(line_buffer.clone())).await.is_err() { 
+                    let mut ws = ws_write.lock().await;
+                    if ws.send(Message::Text(line_buffer.clone())).await.is_err() { 
                         break; 
                     }
 
