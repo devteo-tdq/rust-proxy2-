@@ -24,3 +24,4 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+rand = "0.8"
